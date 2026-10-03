@@ -1,0 +1,44 @@
+# Python Bytecode and Caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Environment Variables & Sensitive Credentials (CRITICAL - NEVER COMMIT)
+.env
+.env*
+!.env.example
+*.pem
+*.key
+*.cer
+*.crt
+*.pfx
+config/*.pem
+config/*.key
+config/kalshi_key.pem
+
+# Database & SQLite files
+*.db
+*.sqlite
+*.sqlite3
+btc_arbitrage.db*
+
+# Logs & Audit Dumps
+*.log
+logs/
+
+# Pytest & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Operating System & Editor Artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp

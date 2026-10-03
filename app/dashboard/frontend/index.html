@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BTC 15M Cross-Exchange Arbitrage Terminal | Polymarket US & Kalshi</title>
+  <style>
+    :root {
+      --bg-dark: #0a0e17;
+      --panel-bg: #121826;
+      --panel-border: #1f293d;
+      --text-main: #e2e8f0;
+      --text-muted: #94a3b8;
+      --accent-blue: #38bdf8;
+      --accent-green: #10b981;
+      --accent-red: #ef4444;
+      --accent-yellow: #f59e0b;
+      --accent-purple: #8b5cf6;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; }
+    body { background: var(--bg-dark); color: var(--text-main); font-size: 13px; line-height: 1.4; padding: 12px; }
+    
+    header {
+      display: flex; justify-content: space-between; align-items: center;
+      background: var(--panel-bg); border: 1px solid var(--panel-border);
+      padding: 12px 16px; border-radius: 6px; margin-bottom: 12px;
+    }
+    .header-left { display: flex; align-items: center; gap: 14px; }
+    .header-title { font-size: 16px; font-weight: 700; color: #fff; letter-spacing: 0.5px; }
+    .status-badge { padding: 3px 8px; border-radius: 4px; font-weight: 700; font-size: 11px; text-transform: uppercase; }
+    .badge-live { background: #dc2626; color: #fff; animation: pulse 2s infinite; }
+    .badge-paper { background: #2563eb; color: #fff; }
+    .badge-data { background: #4b5563; color: #fff; }
+    .badge-connected { background: #064e3b; color: #34d399; }
+    .badge-disconnected { background: #7f1d1d; color: #fca5a5; }
+
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+
+    .header-controls { display: flex; align-items: center; gap: 10px; }
+    .btn { padding: 6px 14px; border-radius: 4px; font-size: 12px; font-weight: 600; cursor: pointer; border: none; }
+    .btn-kill { background: #dc2626; color: #fff; border: 1px solid #b91c1c; font-weight: 700; letter-spacing: 0.5px; }
+    .btn-kill:hover { background: #b91c1c; }
+    .btn-live-toggle { background: #334155; color: #cbd5e1; border: 1px solid #475569; }
+    .btn-live-active { background: #dc2626; color: #fff; }
+
+    /* Match Banner */
+    .match-banner {
+      padding: 12px 16px; border-radius: 6px; margin-bottom: 12px;
+      font-weight: 600; display: flex; justify-content: space-between; align-items: center;
+    }
+    .match-verified { background: rgba(16, 185, 129, 0.15); border: 1px solid #059669; color: #34d399; }
+    .match-rejected { background: rgba(239, 68, 68, 0.15); border: 1px solid #dc2626; color: #f87171; }
+    .match-tag { font-size: 15px; font-weight: 800; letter-spacing: 1px; }
+
+    /* Grid layout */
+    .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 12px; margin-bottom: 12px; }
+    .col-3 { grid-column: span 3; }
+    .col-4 { grid-column: span 4; }
+    .col-6 { grid-column: span 6; }
+    .col-8 { grid-column: span 8; }
+    .col-12 { grid-column: span 12; }
+
+    .card {
+      background: var(--panel-bg); border: 1px solid var(--panel-border);
+      border-radius: 6px; padding: 12px;
+    }
+    .card-title {
+      font-size: 12px; font-weight: 700; color: var(--accent-blue);
+      text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px;
+      border-bottom: 1px solid var(--panel-border); padding-bottom: 4px;
+      display: flex; justify-content: space-between;
+    }
+
+    /* Key Value table */
+    .kv-row { display: flex; justify-content: space-between; padding: 3px 0; border-bottom: 1px solid rgba(255,255,255,0.03); }
+    .kv-label { color: var(--text-muted); }
+    .kv-val { font-weight: 600; font-family: monospace; }
+    .text-green { color: var(--accent-green); }
+    .text-red { color: var(--accent-red); }
+    .text-yellow { color: var(--accent-yellow); }
+    .text-cyan { color: var(--accent-blue); }
+
+    /* Book Table */
+    .book-box { display: flex; gap: 8px; margin-top: 6px; }
+    .book-side { flex: 1; background: rgba(0,0,0,0.25); border-radius: 4px; padding: 8px; text-align: center; }
+    .book-side-title { font-size: 10px; color: var(--text-muted); margin-bottom: 4px; text-transform: uppercase; }
+    .book-side-price { font-size: 16px; font-weight: 700; font-family: monospace; }
+
+    /* Table styles */
+    table { width: 100%; border-collapse: collapse; margin-top: 6px; font-size: 11px; }
+    th { text-align: left; padding: 6px 8px; color: var(--text-muted); border-bottom: 1px solid var(--panel-border); font-weight: 600; }
+    td { padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,0.03); font-family: monospace; }
+    tr:hover { background: rgba(255,255,255,0.02); }
+
+    /* Modal */
+    .modal-overlay {
+      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.85); display: none; justify-content: center; align-items: center; z-index: 100;
+    }
+    .modal-box {
+      background: var(--panel-bg); border: 2px solid var(--accent-red);
+      padding: 24px; border-radius: 8px; max-width: 480px; width: 90%;
+    }
+    .modal-title { font-size: 18px; font-weight: 800; color: var(--accent-red); margin-bottom: 12px; }
+    .modal-body { font-size: 13px; color: #cbd5e1; margin-bottom: 20px; line-height: 1.5; }
+    .modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <header>
+    <div class="header-left">
+      <span class="header-title">BTC 15-MINUTE ARBITRAGE TERMINAL</span>
+      <span id="badge-mode" class="status-badge badge-paper">PAPER MODE</span>
+      <span id="badge-poly-conn" class="status-badge badge-disconnected">POLYMARKET US</span>
+      <span id="badge-kalshi-conn" class="status-badge badge-disconnected">KALSHI</span>
+    </div>
+    <div class="header-controls">
+      <button id="btn-live-toggle" class="btn btn-live-toggle" onclick="promptLiveMode()">LIVE TRADING: OFF</button>
+      <button class="btn btn-kill" onclick="triggerKillSwitch()">EMERGENCY KILL SWITCH</button>
+    </div>
+  </header>
+
+  <!-- Market Equivalence Banner -->
+  <div id="match-banner" class="match-banner match-rejected">
+    <div>
+      <span id="match-status" class="match-tag">MARKET MATCH: CHECKING</span>
+      <div id="match-reason" style="font-size: 12px; font-weight: 400; margin-top: 4px;">Evaluating live contracts...</div>
+    </div>
+    <div id="match-window" style="font-family: monospace; font-size: 12px;">--:-- to --:-- UTC</div>
+  </div>
+
+  <div class="grid">
+    <!-- Polymarket Order Book -->
+    <div class="card col-6">
+      <div class="card-title">
+        <span>Polymarket US (polymarket.us)</span>
+        <span id="poly-ticker" style="color: var(--text-muted); font-size: 11px;">--</span>
+      </div>
+      <div class="kv-row"><span class="kv-label">Market Title:</span><span id="poly-title" class="kv-val">--</span></div>
+      <div class="kv-row"><span class="kv-label">Underlying / Oracle:</span><span id="poly-oracle" class="kv-val">BTC / BRTI 60s TWAP</span></div>
+      <div class="kv-row"><span class="kv-label">Price to Beat (Strike):</span><span id="poly-strike" class="kv-val text-cyan">$--</span></div>
+      <div class="book-box">
+        <div class="book-side"><div class="book-side-title">YES BID</div><div id="poly-yes-bid" class="book-side-price text-green">--</div></div>
+        <div class="book-side"><div class="book-side-title">YES ASK</div><div id="poly-yes-ask" class="book-side-price text-red">--</div></div>
+        <div class="book-side"><div class="book-side-title">NO BID</div><div id="poly-no-bid" class="book-side-price text-green">--</div></div>
+        <div class="book-side"><div class="book-side-title">NO ASK</div><div id="poly-no-ask" class="book-side-price text-red">--</div></div>
+      </div>
+    </div>
+
+    <!-- Kalshi Order Book -->
+    <div class="card col-6">
+      <div class="card-title">
+        <span>Kalshi (kalshi.com)</span>
+        <span id="kalshi-ticker" style="color: var(--text-muted); font-size: 11px;">--</span>
+      </div>
+      <div class="kv-row"><span class="kv-label">Market Ticker:</span><span id="kalshi-title" class="kv-val">--</span></div>
+      <div class="kv-row"><span class="kv-label">Underlying / Oracle:</span><span id="kalshi-oracle" class="kv-val">BTC / BRTI 60s TWAP</span></div>
+      <div class="kv-row"><span class="kv-label">Floor Strike:</span><span id="kalshi-strike" class="kv-val text-cyan">$--</span></div>
+      <div class="book-box">
+        <div class="book-side"><div class="book-side-title">YES BID</div><div id="kalshi-yes-bid" class="book-side-price text-green">--</div></div>
+        <div class="book-side"><div class="book-side-title">YES ASK</div><div id="kalshi-yes-ask" class="book-side-price text-red">--</div></div>
+        <div class="book-side"><div class="book-side-title">NO BID</div><div id="kalshi-no-bid" class="book-side-price text-green">--</div></div>
+        <div class="book-side"><div class="book-side-title">NO ASK</div><div id="kalshi-no-ask" class="book-side-price text-red">--</div></div>
+      </div>
+    </div>
+
+    <!-- Arbitrage Edge Analysis Panel -->
+    <div class="card col-8">
+      <div class="card-title">
+        <span>Active Arbitrage & Conservative Edge Decomposition</span>
+        <span id="arb-direction" class="text-cyan">--</span>
+      </div>
+      <div class="grid" style="margin-bottom: 0;">
+        <div class="col-6">
+          <div class="kv-row"><span class="kv-label">YES Ask Price:</span><span id="edge-yes-ask" class="kv-val">$--</span></div>
+          <div class="kv-row"><span class="kv-label">NO Ask Price:</span><span id="edge-no-ask" class="kv-val">$--</span></div>
+          <div class="kv-row"><span class="kv-label">Raw Combined Acquisition Cost:</span><span id="edge-raw-cost" class="kv-val">$--</span></div>
+          <div class="kv-row"><span class="kv-label">Theoretical Gross Edge ($1.00 - Cost):</span><span id="edge-gross" class="kv-val text-yellow">$--</span></div>
+          <div class="kv-row"><span class="kv-label">Available Book Depth:</span><span id="edge-depth" class="kv-val">-- contracts</span></div>
+        </div>
+        <div class="col-6">
+          <div class="kv-row"><span class="kv-label">Polymarket Taker Fee:</span><span id="edge-poly-fee" class="kv-val text-red">-$--</span></div>
+          <div class="kv-row"><span class="kv-label">Kalshi Taker Fee:</span><span id="edge-kalshi-fee" class="kv-val text-red">-$--</span></div>
+          <div class="kv-row"><span class="kv-label">Dynamic Latency Haircut:</span><span id="edge-latency-buffer" class="kv-val text-red">-$--</span></div>
+          <div class="kv-row"><span class="kv-label">Slippage & Unwind Risk Buffer:</span><span id="edge-slippage" class="kv-val text-red">-$--</span></div>
+          <div class="kv-row"><span class="kv-label">Minimum Profit Reserve:</span><span id="edge-reserve" class="kv-val text-red">-$--</span></div>
+          <div class="kv-row" style="border-top: 1px solid #334155; padding-top: 6px; margin-top: 4px;">
+            <span class="kv-label" style="font-weight: 700; color: #fff;">Conservative Net Executable Edge:</span>
+            <span id="edge-net" class="kv-val text-green" style="font-size: 15px;">$--</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Portfolio & Latency Telemetry -->
+    <div class="card col-4">
+      <div class="card-title">Portfolio & Latency Telemetry</div>
+      <div class="kv-row"><span class="kv-label">Polymarket USD Balance:</span><span id="port-poly-bal" class="kv-val">$--</span></div>
+      <div class="kv-row"><span class="kv-label">Kalshi USD Balance:</span><span id="port-kalshi-bal" class="kv-val">$--</span></div>
+      <div class="kv-row"><span class="kv-label">Paired Hedged Arbitrages:</span><span id="port-hedged" class="kv-val text-green">0</span></div>
+      <div class="kv-row"><span class="kv-label">Unhedged Position:</span><span id="port-unhedged" class="kv-val">0</span></div>
+      <div class="kv-row"><span class="kv-label">Cumulative Realized P&L:</span><span id="port-pnl" class="kv-val text-green">+$0.00</span></div>
+      <div class="kv-row" style="margin-top: 6px; border-top: 1px solid var(--panel-border); padding-top: 6px;">
+        <span class="kv-label">Polymarket REST RTT (p95):</span><span id="lat-poly" class="kv-val">-- ms</span>
+      </div>
+      <div class="kv-row"><span class="kv-label">Kalshi REST RTT (p95):</span><span id="lat-kalshi" class="kv-val">-- ms</span></div>
+      <div class="kv-row"><span class="kv-label">Submit-to-Ack Latency:</span><span id="lat-ack" class="kv-val">-- ms</span></div>
+    </div>
+
+    <!-- Executed Trades -->
+    <div class="card col-6">
+      <div class="card-title">Executed Trade History</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th><th>Trade ID</th><th>Mode</th><th>Direction</th><th>Cost</th><th>Fees</th><th>Net P&L</th><th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="trades-table-body">
+          <tr><td colspan="8" style="text-align: center; color: var(--text-muted);">No trades executed yet</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Rejected Opportunities Log -->
+    <div class="card col-6">
+      <div class="card-title">Rejected Opportunities Log</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th><th>Direction</th><th>Gross Edge</th><th>Net Edge</th><th>Rejection Reason</th>
+          </tr>
+        </thead>
+        <tbody id="rejections-table-body">
+          <tr><td colspan="5" style="text-align: center; color: var(--text-muted);">No rejected opportunities logged</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Live Mode Confirmation Modal -->
+  <div id="live-modal" class="modal-overlay">
+    <div class="modal-box">
+      <div class="modal-title">WARNING: ENABLE LIVE TRADING</div>
+      <div class="modal-body">
+        You are about to enable <strong>LIVE REAL-MONEY TRADING</strong>. Real orders will be submitted to Polymarket US and Kalshi accounts when executable edge conditions are satisfied.<br><br>
+        Risk parameters strictly enforced:<br>
+        - Max contracts per leg: 1 contract<br>
+        - Max concurrent arbitrages: 1<br>
+        - Fail-closed market equivalence check: Active<br>
+        - Automatic one-sided fill liquidation: Active
+      </div>
+      <div class="modal-actions">
+        <button class="btn" style="background: #334155;" onclick="closeModal()">Cancel</button>
+        <button class="btn" style="background: #dc2626; color: #fff;" onclick="confirmLiveMode()">I Understand - Enable LIVE Trading</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    async function updateDashboard() {
+      try {
+        const resp = await fetch("/api/state");
+        if (!resp.ok) return;
+        const data = await resp.json();
+
+        // System badges
+        const modeBadge = document.getElementById("badge-mode");
+        modeBadge.textContent = data.system.trading_mode + " MODE";
+        modeBadge.className = "status-badge " + (
+          data.system.trading_mode === "LIVE" ? "badge-live" :
+          data.system.trading_mode === "PAPER" ? "badge-paper" : "badge-data"
+        );
+
+        const liveBtn = document.getElementById("btn-live-toggle");
+        if (data.system.trading_mode === "LIVE") {
+          liveBtn.textContent = "LIVE TRADING: ACTIVE";
+          liveBtn.className = "btn btn-live-toggle btn-live-active";
+        } else {
+          liveBtn.textContent = "LIVE TRADING: OFF";
+          liveBtn.className = "btn btn-live-toggle";
+        }
+
+        const polyBadge = document.getElementById("badge-poly-conn");
+        polyBadge.className = "status-badge " + (data.system.polymarket_connected ? "badge-connected" : "badge-disconnected");
+        polyBadge.textContent = "POLYMARKET: " + (data.system.polymarket_connected ? "CONNECTED" : "DISCONNECTED");
+
+        const kalshiBadge = document.getElementById("badge-kalshi-conn");
+        kalshiBadge.className = "status-badge " + (data.system.kalshi_connected ? "badge-connected" : "badge-disconnected");
+        kalshiBadge.textContent = "KALSHI: " + (data.system.kalshi_connected ? "CONNECTED" : "DISCONNECTED");
+
+        // Market Match Banner
+        const banner = document.getElementById("match-banner");
+        const statusEl = document.getElementById("match-status");
+        const reasonEl = document.getElementById("match-reason");
+        const windowEl = document.getElementById("match-window");
+
+        if (data.market_match.is_equivalent) {
+          banner.className = "match-banner match-verified";
+          statusEl.textContent = "MARKET MATCH: VERIFIED";
+        } else {
+          banner.className = "match-banner match-rejected";
+          statusEl.textContent = "MARKET MATCH: REJECTED";
+        }
+        reasonEl.textContent = data.market_match.reason;
+        windowEl.textContent = data.market_match.details.window || "--:-- to --:-- UTC";
+
+        // Polymarket details
+        const pm = data.markets.polymarket;
+        if (pm) {
+          document.getElementById("poly-ticker").textContent = pm.ticker;
+          document.getElementById("poly-title").textContent = pm.title;
+          document.getElementById("poly-strike").textContent = "$" + (pm.reference_price || pm.strike || "--");
+        }
+        const pb = data.order_books.polymarket;
+        if (pb) {
+          document.getElementById("poly-yes-bid").textContent = pb.best_yes_bid !== null ? "$" + pb.best_yes_bid.toFixed(2) : "--";
+          document.getElementById("poly-yes-ask").textContent = pb.best_yes_ask !== null ? "$" + pb.best_yes_ask.toFixed(2) : "--";
+          document.getElementById("poly-no-bid").textContent = pb.best_no_bid !== null ? "$" + pb.best_no_bid.toFixed(2) : "--";
+          document.getElementById("poly-no-ask").textContent = pb.best_no_ask !== null ? "$" + pb.best_no_ask.toFixed(2) : "--";
+        }
+
+        // Kalshi details
+        const km = data.markets.kalshi;
+        if (km) {
+          document.getElementById("kalshi-ticker").textContent = km.ticker;
+          document.getElementById("kalshi-title").textContent = km.title;
+          document.getElementById("kalshi-strike").textContent = "$" + (km.reference_price || km.strike || "--");
+        }
+        const kb = data.order_books.kalshi;
+        if (kb) {
+          document.getElementById("kalshi-yes-bid").textContent = kb.best_yes_bid !== null ? "$" + kb.best_yes_bid.toFixed(2) : "--";
+          document.getElementById("kalshi-yes-ask").textContent = kb.best_yes_ask !== null ? "$" + kb.best_yes_ask.toFixed(2) : "--";
+          document.getElementById("kalshi-no-bid").textContent = kb.best_no_bid !== null ? "$" + kb.best_no_bid.toFixed(2) : "--";
+          document.getElementById("kalshi-no-ask").textContent = kb.best_no_ask !== null ? "$" + kb.best_no_ask.toFixed(2) : "--";
+        }
+
+        // Arbitrage Panel
+        if (data.opportunities && data.opportunities.length > 0) {
+          const opp = data.opportunities[0];
+          document.getElementById("arb-direction").textContent = opp.direction;
+          document.getElementById("edge-yes-ask").textContent = "$" + opp.yes_ask.toFixed(4) + " (" + opp.yes_venue + ")";
+          document.getElementById("edge-no-ask").textContent = "$" + opp.no_ask.toFixed(4) + " (" + opp.no_venue + ")";
+          document.getElementById("edge-raw-cost").textContent = "$" + opp.raw_combined_cost.toFixed(4);
+          document.getElementById("edge-gross").textContent = "$" + opp.theoretical_gross_edge.toFixed(4);
+          document.getElementById("edge-depth").textContent = opp.available_quantity + " contracts";
+
+          document.getElementById("edge-poly-fee").textContent = "-$" + opp.poly_fee.toFixed(4);
+          document.getElementById("edge-kalshi-fee").textContent = "-$" + opp.kalshi_fee.toFixed(4);
+          document.getElementById("edge-latency-buffer").textContent = "-$" + opp.latency_risk_buffer.toFixed(4);
+          document.getElementById("edge-slippage").textContent = "-$" + (opp.expected_slippage + opp.unwind_risk_buffer).toFixed(4);
+          document.getElementById("edge-reserve").textContent = "-$" + opp.min_profit_reserve.toFixed(4);
+
+          const netEl = document.getElementById("edge-net");
+          netEl.textContent = (opp.conservative_net_edge >= 0 ? "+$" : "-$") + Math.abs(opp.conservative_net_edge).toFixed(4);
+          netEl.className = "kv-val " + (opp.conservative_net_edge > 0 ? "text-green" : "text-red");
+        }
+
+        // Portfolio
+        const p = data.portfolio;
+        if (p) {
+          document.getElementById("port-poly-bal").textContent = "$" + (p.polymarket_balance_usd || 0).toFixed(2);
+          document.getElementById("port-kalshi-bal").textContent = "$" + (p.kalshi_balance_usd || 0).toFixed(2);
+          document.getElementById("port-hedged").textContent = p.paired_hedged_contracts || 0;
+          document.getElementById("port-unhedged").textContent = p.unhedged_contracts || 0;
+          document.getElementById("port-pnl").textContent = (p.realized_pnl_usd >= 0 ? "+$" : "-$") + Math.abs(p.realized_pnl_usd || 0).toFixed(4);
+        }
+
+        // Latency
+        const l = data.latency;
+        if (l && l.polymarket_rest_rtt) {
+          document.getElementById("lat-poly").textContent = l.polymarket_rest_rtt.p95 + " ms";
+          document.getElementById("lat-kalshi").textContent = l.kalshi_rest_rtt.p95 + " ms";
+          document.getElementById("lat-ack").textContent = (l.pipeline ? l.pipeline.submit_to_ack_p95_ms : "--") + " ms";
+        }
+
+        // Recent trades
+        if (data.recent_trades && data.recent_trades.length > 0) {
+          const tbody = document.getElementById("trades-table-body");
+          tbody.innerHTML = "";
+          data.recent_trades.forEach(t => {
+            const tr = document.createElement("tr");
+            tr.innerHTML = `
+              <td>${t.created_at}</td>
+              <td>${t.trade_id}</td>
+              <td><span class="status-badge ${t.mode === 'LIVE' ? 'badge-live' : 'badge-paper'}">${t.mode}</span></td>
+              <td>${t.direction}</td>
+              <td>$${t.total_cost.toFixed(2)}</td>
+              <td>$${t.fees_paid.toFixed(2)}</td>
+              <td class="${t.realized_pnl >= 0 ? 'text-green' : 'text-red'}">${t.realized_pnl >= 0 ? '+' : ''}$${t.realized_pnl.toFixed(4)}</td>
+              <td>${t.is_hedged ? '<span class="text-green">HEDGED</span>' : '<span class="text-red">UNWOUND</span>'}</td>
+            `;
+            tbody.appendChild(tr);
+          });
+        }
+
+        // Recent rejections
+        if (data.recent_rejections && data.recent_rejections.length > 0) {
+          const rbody = document.getElementById("rejections-table-body");
+          rbody.innerHTML = "";
+          data.recent_rejections.slice(-10).reverse().forEach(r => {
+            const tr = document.createElement("tr");
+            tr.innerHTML = `
+              <td>${r.detected_at.split('T')[1].slice(0,8)}</td>
+              <td>${r.direction}</td>
+              <td>$${parseFloat(r.theoretical_gross_edge).toFixed(4)}</td>
+              <td class="text-red">$${parseFloat(r.conservative_net_edge).toFixed(4)}</td>
+              <td style="color: var(--text-muted);">${r.rejection_reason}</td>
+            `;
+            rbody.appendChild(tr);
+          });
+        }
+
+      } catch (e) {
+        console.error("Dashboard poll error:", e);
+      }
+    }
+
+    function promptLiveMode() {
+      document.getElementById("live-modal").style.display = "flex";
+    }
+
+    function closeModal() {
+      document.getElementById("live-modal").style.display = "none";
+    }
+
+    async function confirmLiveMode() {
+      closeModal();
+      await fetch("/api/controls/mode", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({mode: "LIVE", confirmation: "I understand this will submit real orders."})
+      });
+      updateDashboard();
+    }
+
+    async function triggerKillSwitch() {
+      if (confirm("ACTIVATE EMERGENCY KILL SWITCH? All trading will halt immediately.")) {
+        await fetch("/api/controls/kill", {method: "POST"});
+        updateDashboard();
+      }
+    }
+
+    setInterval(updateDashboard, 500);
+    updateDashboard();
+  </script>
+</body>
+</html>
