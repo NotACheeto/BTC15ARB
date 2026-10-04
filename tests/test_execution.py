@@ -119,6 +119,7 @@ async def test_one_sided_fill_emergency_recovery(execution_fixture, monkeypatch)
         res_no.status = ExecutionStatus.REJECTED
         res_no.fill_quantity = 0
         res_no.fill_price = None
+        res_no.fee_paid = Decimal("0.00")
         return res_yes, res_no
 
     monkeypatch.setattr(engine, "_simulate_paper_execution", mock_sim_one_sided)

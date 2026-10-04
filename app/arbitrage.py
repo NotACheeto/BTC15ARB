@@ -1,8 +1,9 @@
 """Arbitrage opportunity detection and conservative executable edge engine.
 
 Evaluates both trading directions (Buy Poly YES + Buy Kalshi NO, and Buy Kalshi YES + Buy Poly NO).
-Deducts all fees, slippage, dynamic latency buffer, unwind risk buffer, and profit reserve
-using exact Decimal arithmetic.
+Deducts all fees, slippage, dynamic latency buffer, unwind risk buffer, and profit reserve.
+Enforces real order book depth, cross-venue quote skew bounds (<= 500ms),
+and probabilistic EV validation factoring in orphan risk.
 """
 
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 ONE = Decimal("1.00")
 ZERO = Decimal("0.00")
+MAX_QUOTE_SKEW_MS = 500.0  # Maximum allowable timestamp delta between venues
 
 
 class ArbitrageCalculator:
@@ -52,6 +54,11 @@ class ArbitrageCalculator:
         poly_stale = poly_age_ns > max_age_ns
         kalshi_stale = kalshi_age_ns > max_age_ns
 
+        # Cross-venue quote skew check (must be <= 500ms apart)
+        quote_skew_ns = abs(poly_book.timestamp_ns - kalshi_book.timestamp_ns)
+        quote_skew_ms = float(quote_skew_ns) / 1_000_000.0
+        quote_skew_exceeded = quote_skew_ms > MAX_QUOTE_SKEW_MS
+
         # Dynamic latency risk haircut
         latency_buffer = latency_tracker.calculate_latency_risk_buffer(
             mode=self.settings.LATENCY_BUFFER_MODE
@@ -60,6 +67,12 @@ class ArbitrageCalculator:
         market_window = (
             f"{poly_market.interval_start.isoformat()}-{poly_market.interval_end.isoformat()}"
         )
+
+        # Real depth enforcement: NO fictitious defaults to 1 or 100
+        poly_yes_depth = poly_book.best_yes_ask_size if poly_book.best_yes_ask_size is not None else ZERO
+        poly_no_depth = poly_book.best_no_ask_size if poly_book.best_no_ask_size is not None else ZERO
+        kalshi_yes_depth = kalshi_book.best_yes_ask_size if kalshi_book.best_yes_ask_size is not None else ZERO
+        kalshi_no_depth = kalshi_book.best_no_ask_size if kalshi_book.best_no_ask_size is not None else ZERO
 
         # -------------------------------------------------------------
         # Direction 1: Buy Polymarket YES + Buy Kalshi NO
@@ -70,13 +83,15 @@ class ArbitrageCalculator:
             no_venue=Venue.KALSHI,
             yes_ask=poly_book.best_yes_ask,
             no_ask=kalshi_book.best_no_ask,
-            yes_depth=poly_book.best_yes_ask_size or Decimal("1"),
-            no_depth=kalshi_book.best_no_ask_size or Decimal("1"),
+            yes_depth=poly_yes_depth,
+            no_depth=kalshi_no_depth,
             poly_market=poly_market,
             kalshi_market=kalshi_market,
             market_window=market_window,
             poly_stale=poly_stale,
             kalshi_stale=kalshi_stale,
+            quote_skew_exceeded=quote_skew_exceeded,
+            quote_skew_ms=quote_skew_ms,
             latency_buffer=latency_buffer,
             now_ns=now_ns,
         )
@@ -91,13 +106,15 @@ class ArbitrageCalculator:
             no_venue=Venue.POLYMARKET_US,
             yes_ask=kalshi_book.best_yes_ask,
             no_ask=poly_book.best_no_ask,
-            yes_depth=kalshi_book.best_yes_ask_size or Decimal("1"),
-            no_depth=poly_book.best_no_ask_size or Decimal("1"),
+            yes_depth=kalshi_yes_depth,
+            no_depth=poly_no_depth,
             poly_market=poly_market,
             kalshi_market=kalshi_market,
             market_window=market_window,
             poly_stale=poly_stale,
             kalshi_stale=kalshi_stale,
+            quote_skew_exceeded=quote_skew_exceeded,
+            quote_skew_ms=quote_skew_ms,
             latency_buffer=latency_buffer,
             now_ns=now_ns,
         )
@@ -119,11 +136,14 @@ class ArbitrageCalculator:
         market_window: str,
         poly_stale: bool,
         kalshi_stale: bool,
+        quote_skew_exceeded: bool,
+        quote_skew_ms: float,
         latency_buffer: Decimal,
         now_ns: int,
     ) -> ArbitrageOpportunity:
         opp_id = f"opp-{uuid.uuid4().hex[:10]}"
         target_qty = self.settings.MAX_CONTRACTS_PER_LEG  # Default: 1
+        available_qty = int(min(yes_depth, no_depth))
 
         # Missing quote check
         if yes_ask is None or no_ask is None:
@@ -137,6 +157,8 @@ class ArbitrageCalculator:
                 no_venue=no_venue,
                 yes_ask=yes_ask or ZERO,
                 no_ask=no_ask or ZERO,
+                available_quantity=available_qty,
+                target_quantity=target_qty,
                 raw_combined_cost=ZERO,
                 theoretical_gross_edge=ZERO,
                 poly_fee=ZERO,
@@ -148,6 +170,8 @@ class ArbitrageCalculator:
                 unwind_risk_buffer=ZERO,
                 min_profit_reserve=ZERO,
                 conservative_net_edge=ZERO,
+                expected_value=ZERO,
+                quote_skew_ms=quote_skew_ms,
                 executable_max_yes_price=ZERO,
                 executable_max_no_price=ZERO,
                 is_executable=False,
@@ -177,18 +201,16 @@ class ArbitrageCalculator:
         execution_risk = Decimal("0.005")  # 0.5 cents baseline execution uncertainty
         profit_reserve = self.settings.MIN_PROFIT_RESERVE
 
-        # Total deductions
-        total_deductions = (
-            total_fees
-            + expected_slippage
-            + latency_buffer
-            + execution_risk
-            + unwind_risk
-            + profit_reserve
-        )
+        # 4. Probabilistic EV factoring in orphan risk
+        # Conservative orphan probability = 5% (0.05)
+        p_orphan = Decimal("0.05")
+        p_clean = Decimal("0.95")
+        clean_gain = theoretical_gross_edge - total_fees - expected_slippage - latency_buffer - execution_risk
+        unwind_loss = self.settings.MAX_ORPHAN_EXIT_LOSS + Decimal("0.02")  # Exit loss + taker unwind fee
+        expected_value = (p_clean * clean_gain) - (p_orphan * unwind_loss)
 
-        # 4. Conservative net executable edge
-        conservative_net_edge = theoretical_gross_edge - total_deductions
+        # Conservative net edge considers both deterministic haircut and probabilistic EV
+        conservative_net_edge = min(clean_gain - unwind_risk, expected_value) - profit_reserve
 
         # 5. Bound maximum acceptable execution limit prices
         # Guarantee that even in the worst-case scenario where both limit orders fill at their maximum limits,
@@ -215,17 +237,23 @@ class ArbitrageCalculator:
         elif kalshi_stale:
             is_executable = False
             rejection_reason = "Kalshi market data is stale"
+        elif quote_skew_exceeded:
+            is_executable = False
+            rejection_reason = f"Cross-venue quote skew ({quote_skew_ms:.1f}ms) exceeds {MAX_QUOTE_SKEW_MS:.0f}ms limit"
         elif min(yes_depth, no_depth) < target_qty:
             is_executable = False
-            rejection_reason = f"Insufficient book depth: available={min(yes_depth, no_depth)}, target={target_qty}"
+            rejection_reason = f"Insufficient real book depth: available={min(yes_depth, no_depth)}, target={target_qty}"
         elif theoretical_gross_edge <= ZERO:
             is_executable = False
             rejection_reason = f"Negative theoretical gross edge: {theoretical_gross_edge:.4f}"
+        elif expected_value <= ZERO:
+            is_executable = False
+            rejection_reason = f"Non-positive probabilistic EV factoring in orphan risk (EV={expected_value:.4f})"
         elif conservative_net_edge < self.settings.MIN_NET_EDGE:
             is_executable = False
             rejection_reason = (
                 f"Net edge {conservative_net_edge:.4f} below MIN_NET_EDGE threshold {self.settings.MIN_NET_EDGE:.4f} "
-                f"(Fees={total_fees:.4f}, LatencyHaircut={latency_buffer:.4f})"
+                f"(Fees={total_fees:.4f}, EV={expected_value:.4f}, LatencyHaircut={latency_buffer:.4f})"
             )
 
         return ArbitrageOpportunity(
@@ -238,7 +266,7 @@ class ArbitrageCalculator:
             no_venue=no_venue,
             yes_ask=yes_ask,
             no_ask=no_ask,
-            available_quantity=int(min(yes_depth, no_depth)),
+            available_quantity=available_qty,
             target_quantity=target_qty,
             payout=ONE,
             raw_combined_cost=raw_combined_cost,
@@ -252,6 +280,8 @@ class ArbitrageCalculator:
             unwind_risk_buffer=unwind_risk,
             min_profit_reserve=profit_reserve,
             conservative_net_edge=conservative_net_edge,
+            expected_value=expected_value,
+            quote_skew_ms=quote_skew_ms,
             executable_max_yes_price=max_yes_px,
             executable_max_no_price=max_no_px,
             is_executable=is_executable,

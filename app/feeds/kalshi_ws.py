@@ -110,6 +110,9 @@ class KalshiFeed:
                 break
             except Exception as e:
                 self._connected = False
+                self.order_book = None
+                self._yes_bids.clear()
+                self._no_bids.clear()
                 logger.warning("Kalshi WS disconnected (%s), reconnecting in %.1fs...", e, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(5.0, backoff * 1.5)
@@ -188,17 +191,19 @@ class KalshiFeed:
         # Best NO Ask = 1 - Best YES Bid
         best_no_ask = (Decimal("1.00") - best_yes_bid) if best_yes_bid else None
 
-        # Sizes at best asks
-        best_yes_ask_size = Decimal("100")
-        best_no_ask_size = Decimal("100")
-        for lvl in no_bids:
-            if lvl.price == best_no_bid:
-                best_yes_ask_size = lvl.quantity
-                break
-        for lvl in yes_bids:
-            if lvl.price == best_yes_bid:
-                best_no_ask_size = lvl.quantity
-                break
+        # Sizes at best asks (strictly extracted from real book levels, never fictitious defaults)
+        best_yes_ask_size = None
+        best_no_ask_size = None
+        if best_no_bid is not None:
+            for lvl in no_bids:
+                if lvl.price == best_no_bid:
+                    best_yes_ask_size = lvl.quantity
+                    break
+        if best_yes_bid is not None:
+            for lvl in yes_bids:
+                if lvl.price == best_yes_bid:
+                    best_no_ask_size = lvl.quantity
+                    break
 
         book = OrderBookState(
             venue=Venue.KALSHI,
@@ -220,7 +225,7 @@ class KalshiFeed:
         self._notify(book)
 
     async def _poll_orderbook_loop(self) -> None:
-        """High-frequency REST order book polling loop."""
+        """High-frequency REST order book polling loop with WS collision prevention."""
         self._connected = True
         while self._running:
             try:
@@ -229,9 +234,17 @@ class KalshiFeed:
                     continue
 
                 recv_ns = time.perf_counter_ns()
+
+                # WS collision check: if WS is active and received data in the last 500ms, don't overwrite
+                if self._ws_task and not self._ws_task.done() and (recv_ns - self.last_update_ns) < 500_000_000:
+                    await asyncio.sleep(0.25)
+                    continue
+
                 raw_book = await self.client.get_orderbook(self.current_ticker)
-                ob_data = raw_book.get("orderbook_fp") or raw_book.get("orderbook") or raw_book
-                self._apply_snapshot(ob_data, recv_ns)
+                now_ns = time.perf_counter_ns()
+                if now_ns > self.last_update_ns:
+                    ob_data = raw_book.get("orderbook_fp") or raw_book.get("orderbook") or raw_book
+                    self._apply_snapshot(ob_data, now_ns)
 
                 await asyncio.sleep(0.25)
 

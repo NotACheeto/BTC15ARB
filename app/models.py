@@ -157,8 +157,10 @@ class ArbitrageOpportunity(BaseModel):
     unwind_risk_buffer: Decimal
     min_profit_reserve: Decimal
 
-    # Final conservative edge
+    # Final conservative edge & probabilistic EV
     conservative_net_edge: Decimal
+    expected_value: Decimal = Decimal("0.00")
+    quote_skew_ms: float = 0.0
 
     # Maximum acceptable limit execution prices
     executable_max_yes_price: Decimal

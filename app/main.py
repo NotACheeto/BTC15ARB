@@ -178,6 +178,9 @@ class TradingApplication:
                         self._active_market_pair = (p_mkt, k_mkt)
                         await self.poly_feed.stop()
                         await self.kalshi_feed.stop()
+                        dashboard_state.poly_book = None
+                        dashboard_state.kalshi_book = None
+                        dashboard_state.latest_opportunities = []
                         await self.poly_feed.start(p_mkt.ticker)
                         await self.kalshi_feed.start(k_mkt.ticker)
                 else:
@@ -186,6 +189,9 @@ class TradingApplication:
                         self._active_market_pair = None
                         await self.poly_feed.stop()
                         await self.kalshi_feed.stop()
+                        dashboard_state.poly_book = None
+                        dashboard_state.kalshi_book = None
+                        dashboard_state.latest_opportunities = []
                         from app.models import MarketEquivalenceResult
                         dashboard_state.equivalence_result = MarketEquivalenceResult(
                             is_equivalent=False,

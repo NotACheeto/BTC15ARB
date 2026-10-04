@@ -31,6 +31,7 @@ class PortfolioManager:
         # Exposure & PnL
         self.paired_hedged_contracts: int = 0
         self.unhedged_contracts: int = 0
+        self.cumulative_unhedged_contracts: int = 0
         self.realized_pnl: Decimal = Decimal("0.00")
         self.unrealized_pnl: Decimal = Decimal("0.00")
         self.trade_history: list[ArbitrageTradeRecord] = []
@@ -60,17 +61,26 @@ class PortfolioManager:
         return self.polymarket_cash_usd, self.kalshi_cash_usd
 
     def record_trade(self, trade: ArbitrageTradeRecord) -> None:
-        """Record completed trade and update cumulative P&L."""
+        """Record completed trade and update cumulative P&L and contract accounting."""
+        from app.models import ExecutionStatus
         self.trade_history.append(trade)
         self.realized_pnl += trade.realized_pnl
-        if trade.is_hedged:
-            self.paired_hedged_contracts += 1
-        else:
-            if trade.recovery_action:
-                # Position was neutralized
-                pass
-            else:
-                self.unhedged_contracts += 1
+
+        yes_qty = trade.leg_yes.fill_quantity if trade.leg_yes else 0
+        no_qty = trade.leg_no.fill_quantity if trade.leg_no else 0
+        hedged_qty = min(yes_qty, no_qty)
+        self.paired_hedged_contracts += hedged_qty
+
+        orphan_qty = abs(yes_qty - no_qty)
+        if orphan_qty > 0:
+            self.cumulative_unhedged_contracts += orphan_qty
+            liquidated_qty = (
+                trade.recovery_result.fill_quantity
+                if (trade.recovery_result and trade.recovery_result.status == ExecutionStatus.FILLED)
+                else 0
+            )
+            unhedged_remaining = max(0, orphan_qty - liquidated_qty)
+            self.unhedged_contracts += unhedged_remaining
 
     def get_portfolio_summary(self) -> dict:
         """Snapshot of portfolio status for dashboard and risk checks."""
@@ -80,6 +90,7 @@ class PortfolioManager:
             "total_balance_usd": float(self.polymarket_cash_usd + self.kalshi_cash_usd),
             "paired_hedged_contracts": self.paired_hedged_contracts,
             "unhedged_contracts": self.unhedged_contracts,
+            "cumulative_unhedged_contracts": self.cumulative_unhedged_contracts,
             "realized_pnl_usd": float(self.realized_pnl),
             "unrealized_pnl_usd": float(self.unrealized_pnl),
             "total_trades_count": len(self.trade_history),

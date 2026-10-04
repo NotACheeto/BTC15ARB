@@ -170,7 +170,10 @@ def test_edge_haircut_absorbs_thin_edge(calc_fixture):
     assert opp1.theoretical_gross_edge == Decimal("0.03")
     assert opp1.conservative_net_edge < Decimal("0.00")
     assert opp1.is_executable is False
-    assert "below min_net_edge" in opp1.rejection_reason.lower()
+    assert (
+        "below min_net_edge" in opp1.rejection_reason.lower()
+        or "non-positive" in opp1.rejection_reason.lower()
+    )
 
 
 def test_stale_quote_rejected(calc_fixture):

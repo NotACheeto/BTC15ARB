@@ -186,9 +186,14 @@ class PolymarketUSClient:
         url = f"{self.api_base_url}{path}"
         headers = self._get_headers("POST", path)
 
-        intent = "ORDER_INTENT_BUY_LONG" if order.outcome.value == "YES" else "ORDER_INTENT_BUY_SHORT"
+        market_slug = order.ticker if order.ticker else order.market_id
+        if order.side.value == "SELL":
+            intent = "ORDER_INTENT_SELL_LONG" if order.outcome.value == "YES" else "ORDER_INTENT_SELL_SHORT"
+        else:
+            intent = "ORDER_INTENT_BUY_LONG" if order.outcome.value == "YES" else "ORDER_INTENT_BUY_SHORT"
+
         payload = {
-            "marketSlug": order.market_id,
+            "marketSlug": market_slug,
             "intent": intent,
             "type": "ORDER_TYPE_LIMIT",
             "price": {"value": f"{order.price:.4f}", "currency": "USD"},
@@ -205,17 +210,77 @@ class PolymarketUSClient:
                 data = await resp.json()
 
                 if resp.status in (200, 201):
-                    order_id = data.get("orderId") or data.get("id") or str(data.get("order", {}).get("id", ""))
-                    status_raw = data.get("status", "FILLED")
-                    status = ExecutionStatus.FILLED if status_raw in ("FILLED", "MATCHED", "EXECUTED") else ExecutionStatus.ACKNOWLEDGED
+                    order_obj = data.get("order") if isinstance(data.get("order"), dict) else data
+                    exec_obj = data.get("execution") if isinstance(data.get("execution"), dict) else {}
 
+                    order_id = (
+                        data.get("orderId")
+                        or order_obj.get("id")
+                        or order_obj.get("orderId")
+                        or data.get("id")
+                        or ""
+                    )
+
+                    status_raw = str(
+                        order_obj.get("status")
+                        or data.get("status")
+                        or ""
+                    ).upper()
+
+                    # Extract filled quantity safely
+                    executed_qty = 0
+                    for q_key in ("filledQuantity", "executedQuantity", "cumQuantity", "fillQuantity", "executedShares"):
+                        val = exec_obj.get(q_key) or order_obj.get(q_key) or data.get(q_key)
+                        if val is not None:
+                            try:
+                                executed_qty = int(Decimal(str(val)))
+                                break
+                            except Exception:
+                                pass
+
+                    if status_raw in ("ORDER_STATUS_FILLED", "FILLED", "MATCHED", "EXECUTED"):
+                        status = ExecutionStatus.FILLED
+                        fill_qty = executed_qty if executed_qty > 0 else order.quantity
+                    elif status_raw in ("ORDER_STATUS_PARTIALLY_FILLED", "PARTIALLY_FILLED") or (0 < executed_qty < order.quantity):
+                        status = ExecutionStatus.PARTIALLY_FILLED
+                        fill_qty = executed_qty
+                    elif status_raw in ("ORDER_STATUS_CANCELED", "CANCELED", "CANCELLED", "ORDER_STATUS_EXPIRED", "EXPIRED", "ORDER_STATUS_REJECTED", "REJECTED"):
+                        status = ExecutionStatus.REJECTED
+                        fill_qty = 0
+                    elif status_raw in ("ORDER_STATUS_OPEN", "OPEN", "PENDING", "ORDER_STATUS_NEW"):
+                        status = ExecutionStatus.ACKNOWLEDGED
+                        fill_qty = executed_qty
+                    else:
+                        # Fail-closed: Never assume filled unless verified
+                        status = ExecutionStatus.ACKNOWLEDGED
+                        fill_qty = executed_qty
+
+                    # Extract fill price safely
                     fill_price = order.price
-                    if "fillPrice" in data:
-                        fill_price = Decimal(str(data["fillPrice"]))
+                    for p_key in ("fillPrice", "executionPrice", "avgPrice", "averagePrice"):
+                        val = exec_obj.get(p_key) or order_obj.get(p_key) or data.get(p_key)
+                        if val is not None:
+                            if isinstance(val, dict) and "value" in val:
+                                fill_price = Decimal(str(val["value"]))
+                                break
+                            else:
+                                fill_price = Decimal(str(val))
+                                break
 
+                    # Extract fees safely
                     fee_paid = Decimal("0.00")
-                    if "fee" in data:
-                        fee_paid = Decimal(str(data["fee"]))
+                    for f_key in ("fee", "feePaid", "fees", "feeAmount"):
+                        val = exec_obj.get(f_key) or order_obj.get(f_key) or data.get(f_key)
+                        if val is not None:
+                            if isinstance(val, dict) and "value" in val:
+                                fee_paid = Decimal(str(val["value"]))
+                                break
+                            else:
+                                try:
+                                    fee_paid = Decimal(str(val))
+                                    break
+                                except Exception:
+                                    pass
 
                     return OrderExecutionResult(
                         venue=Venue.POLYMARKET_US,
@@ -226,11 +291,11 @@ class PolymarketUSClient:
                         price=order.price,
                         fill_price=fill_price,
                         quantity=order.quantity,
-                        fill_quantity=order.quantity if status == ExecutionStatus.FILLED else 0,
+                        fill_quantity=fill_qty,
                         fee_paid=fee_paid,
                         submitted_at_ns=submit_ns,
                         ack_at_ns=ack_ns,
-                        filled_at_ns=ack_ns if status == ExecutionStatus.FILLED else 0,
+                        filled_at_ns=ack_ns if fill_qty > 0 else 0,
                         raw_response=data,
                     )
                 else:

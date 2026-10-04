@@ -31,7 +31,7 @@ FORBIDDEN_ASSET_PATTERNS = [
 def are_markets_equivalent(
     polymarket_market: NormalizedMarket,
     kalshi_market: NormalizedMarket,
-    strike_tolerance: Decimal = Decimal("0.50"),  # Maximum allowable strike discrepancy in USD
+    strike_tolerance: Decimal = Decimal("0.00"),  # Zero-tolerance strike equality ($0.00 difference)
 ) -> MarketEquivalenceResult:
     """Strict, deterministic, fail-closed equivalence verification.
     
@@ -204,24 +204,38 @@ def are_markets_equivalent(
             details=details,
         )
 
-    # 9. Reference / Strike Price Consistency Check
+    # 9. Strict Confirmed Strike Price Equality ($0.00 Difference Enforced)
     p_strike = polymarket_market.reference_price or polymarket_market.strike
     k_strike = kalshi_market.reference_price or kalshi_market.strike
 
-    if p_strike is not None and k_strike is not None:
-        strike_diff = abs(p_strike - k_strike)
-        if strike_diff > strike_tolerance:
-            return MarketEquivalenceResult(
-                is_equivalent=False,
-                status="REJECTED",
-                reason=(
-                    f"Strike / Reference price discrepancy exceeds tolerance: "
-                    f"Poly=${p_strike} vs Kalshi=${k_strike} (Diff=${strike_diff} > ${strike_tolerance})"
-                ),
-                polymarket_id=polymarket_market.market_id,
-                kalshi_id=kalshi_market.market_id,
-                details={"poly_strike": str(p_strike), "kalshi_strike": str(k_strike), **details},
-            )
+    if p_strike is None or k_strike is None:
+        return MarketEquivalenceResult(
+            is_equivalent=False,
+            status="REJECTED",
+            reason=(
+                f"Missing confirmed strike/reference price: "
+                f"Polymarket={'None' if p_strike is None else str(p_strike)}, "
+                f"Kalshi={'None' if k_strike is None else str(k_strike)}. "
+                "Confirmed strike values required on both sides."
+            ),
+            polymarket_id=polymarket_market.market_id,
+            kalshi_id=kalshi_market.market_id,
+            details={"poly_strike": str(p_strike), "kalshi_strike": str(k_strike), **details},
+        )
+
+    strike_diff = abs(p_strike - k_strike)
+    if strike_diff > strike_tolerance:
+        return MarketEquivalenceResult(
+            is_equivalent=False,
+            status="REJECTED",
+            reason=(
+                f"Strike price discrepancy exceeds tolerance ($0.00 zero-tolerance enforced): "
+                f"Poly=${p_strike} vs Kalshi=${k_strike} (Diff=${strike_diff} > ${strike_tolerance})"
+            ),
+            polymarket_id=polymarket_market.market_id,
+            kalshi_id=kalshi_market.market_id,
+            details={"poly_strike": str(p_strike), "kalshi_strike": str(k_strike), **details},
+        )
 
     # 10. Contract Payout & Multiplier Check
     if polymarket_market.payout != Decimal("1.00") or kalshi_market.payout != Decimal("1.00"):

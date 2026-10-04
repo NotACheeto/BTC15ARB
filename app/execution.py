@@ -135,9 +135,22 @@ class ExecutionEngine:
             return trade_record
 
         finally:
-            unhedged = 1 if (trade_record and not trade_record.is_hedged) else 0
+            unhedged_remaining = 0
+            orphan_qty = 0
+            if trade_record and not trade_record.is_hedged:
+                orphan_qty = abs(trade_record.leg_yes.fill_quantity - trade_record.leg_no.fill_quantity)
+                liquidated_qty = (
+                    trade_record.recovery_result.fill_quantity
+                    if (trade_record.recovery_result and trade_record.recovery_result.status == ExecutionStatus.FILLED)
+                    else 0
+                )
+                unhedged_remaining = max(0, orphan_qty - liquidated_qty)
+
             self.risk_manager.record_arbitrage_finished(
-                opp.opportunity_id, opp.market_window, unhedged=unhedged
+                opp.opportunity_id,
+                opp.market_window,
+                unhedged=unhedged_remaining,
+                orphan_encountered=orphan_qty,
             )
 
     async def _submit_live_leg(self, req: OrderRequest) -> OrderExecutionResult:
@@ -206,9 +219,12 @@ class ExecutionEngine:
         submit_start_ns: int,
         submit_end_ns: int,
     ) -> ArbitrageTradeRecord:
-        """Handle execution results, detect one-sided fills, and trigger emergency unwind."""
-        yes_filled = result_yes.status == ExecutionStatus.FILLED
-        no_filled = result_no.status == ExecutionStatus.FILLED
+        """Handle execution results, accurately reconcile partial fills, and trigger emergency IOC unwind."""
+        yes_qty = result_yes.fill_quantity if result_yes.status in (ExecutionStatus.FILLED, ExecutionStatus.PARTIALLY_FILLED) else 0
+        no_qty = result_no.fill_quantity if result_no.status in (ExecutionStatus.FILLED, ExecutionStatus.PARTIALLY_FILLED) else 0
+
+        hedged_qty = min(yes_qty, no_qty)
+        orphan_qty = abs(yes_qty - no_qty)
 
         recovery_action = None
         recovery_result = None
@@ -216,83 +232,119 @@ class ExecutionEngine:
         realized_pnl = Decimal("0.00")
 
         # -------------------------------------------------------------
-        # Scenario A: Clean Double Fill (Fully Hedged)
+        # Scenario A: Clean Symmetrical Fill (Fully Hedged)
         # -------------------------------------------------------------
-        if yes_filled and no_filled:
+        if yes_qty > 0 and no_qty > 0 and yes_qty == no_qty:
             is_hedged = True
-            total_acquisition_cost = (result_yes.fill_price or opp.yes_ask) + (result_no.fill_price or opp.no_ask)
+            total_acquisition_cost = (
+                (result_yes.fill_price or opp.yes_ask) * Decimal(hedged_qty)
+                + (result_no.fill_price or opp.no_ask) * Decimal(hedged_qty)
+            )
             total_fees = result_yes.fee_paid + result_no.fee_paid
-            # Settlement value = $1.00
-            realized_pnl = Decimal("1.00") - total_acquisition_cost - total_fees
+            # Settlement value = $1.00 per hedged contract
+            realized_pnl = (Decimal("1.00") * Decimal(hedged_qty)) - total_acquisition_cost - total_fees
             logger.info(
-                "SUCCESSFUL ARB TRADE %s: Cost=$%.4f, Fees=$%.4f, Expected Net P&L=+$%.4f",
-                trade_id, total_acquisition_cost, total_fees, realized_pnl
+                "SUCCESSFUL ARB TRADE %s: HedgedQty=%d, Cost=$%.4f, Fees=$%.4f, Expected Net P&L=+$%.4f",
+                trade_id, hedged_qty, total_acquisition_cost, total_fees, realized_pnl
             )
 
         # -------------------------------------------------------------
         # Scenario B: Neither Leg Filled
         # -------------------------------------------------------------
-        elif not yes_filled and not no_filled:
+        elif yes_qty == 0 and no_qty == 0:
             is_hedged = False
             realized_pnl = Decimal("0.00")
             logger.warning("Both legs unfilled for %s; position neutral", trade_id)
 
+            # Cancel any resting orders that might linger
+            for res, req in ((result_yes, leg_yes_req), (result_no, leg_no_req)):
+                if res.order_id and res.status == ExecutionStatus.ACKNOWLEDGED:
+                    try:
+                        if res.venue == Venue.POLYMARKET_US:
+                            await self.poly_client.cancel_order(res.order_id, req.market_id)
+                        else:
+                            await self.kalshi_client.cancel_order(res.order_id)
+                    except Exception as e:
+                        logger.warning("Error cleaning up unfilled order: %s", e)
+
         # -------------------------------------------------------------
-        # Scenario C: ONE-SIDED FILL EMERGENCY RECOVERY
+        # Scenario C: ONE-SIDED OR ASYMMETRICAL PARTIAL FILL (ORPHAN UNWIND)
         # -------------------------------------------------------------
         else:
             is_hedged = False
             logger.critical(
-                "ONE-SIDED FILL DETECTED ON TRADE %s! YES_FILLED=%s, NO_FILLED=%s. INITIATING EMERGENCY UNWIND.",
-                trade_id, yes_filled, no_filled
+                "ASYMMETRICAL/ONE-SIDED FILL ON TRADE %s! YES_QTY=%d, NO_QTY=%d, ORPHAN_QTY=%d. INITIATING TARGETED IOC UNWIND.",
+                trade_id, yes_qty, no_qty, orphan_qty
             )
 
-            # Filled leg is YES, unhedged leg is NO
-            if yes_filled and not no_filled:
-                filled_res = result_yes
-                filled_req = leg_yes_req
-                unfilled_res = result_no
+            # Identify orphan side
+            if yes_qty > no_qty:
+                orphan_res = result_yes
+                orphan_req = leg_yes_req
+                underfilled_res = result_no
+                underfilled_req = leg_no_req
                 orphan_side = "YES"
             else:
-                filled_res = result_no
-                filled_req = leg_no_req
-                unfilled_res = result_yes
+                orphan_res = result_no
+                orphan_req = leg_no_req
+                underfilled_res = result_yes
+                underfilled_req = leg_yes_req
                 orphan_side = "NO"
 
-            # 1. Immediately cancel the unfilled leg order if open/resting
-            if unfilled_res.order_id:
+            # 1. Immediately cancel any resting remainder on underfilled leg
+            if underfilled_res.order_id and underfilled_res.status not in (ExecutionStatus.FILLED, ExecutionStatus.REJECTED):
                 try:
-                    logger.info("Cancelling unfilled resting order %s on %s", unfilled_res.order_id, unfilled_res.venue.value)
-                    if unfilled_res.venue == Venue.POLYMARKET_US:
-                        await self.poly_client.cancel_order(unfilled_res.order_id, opp.polymarket_market.market_id)
+                    logger.info("Cancelling resting underfilled order %s on %s", underfilled_res.order_id, underfilled_res.venue.value)
+                    if underfilled_res.venue == Venue.POLYMARKET_US:
+                        await self.poly_client.cancel_order(underfilled_res.order_id, underfilled_req.market_id)
                     else:
-                        await self.kalshi_client.cancel_order(unfilled_res.order_id)
+                        await self.kalshi_client.cancel_order(underfilled_res.order_id)
                 except Exception as e:
-                    logger.error("Error cancelling unfilled leg: %s", e)
+                    logger.error("Error cancelling underfilled leg remainder: %s", e)
 
-            # 2. Emergency unwind of the filled orphan position
-            recovery_action = f"EMERGENCY_UNWIND_{orphan_side}_LEG"
+            # 2. Targeted IOC opposite order emergency unwind of exactly orphan_qty
+            recovery_action = f"EMERGENCY_UNWIND_IOC_{orphan_side}_LEG_{orphan_qty}X"
             recovery_result = await self._emergency_unwind_position(
-                filled_res=filled_res,
-                filled_req=filled_req,
+                filled_res=orphan_res,
+                filled_req=orphan_req,
+                unwind_quantity=orphan_qty,
                 mode=mode,
                 opp=opp,
             )
 
-            # Calculate loss taken on emergency liquidation
-            fill_px = filled_res.fill_price or Decimal("0.50")
+            # 3. Accurate realized PnL reconciliation:
+            # Hedged portion (if any partial symmetry existed)
+            hedged_pnl = Decimal("0.00")
+            if hedged_qty > 0:
+                h_cost = (
+                    (result_yes.fill_price or opp.yes_ask) * Decimal(hedged_qty)
+                    + (result_no.fill_price or opp.no_ask) * Decimal(hedged_qty)
+                )
+                hedged_pnl = (Decimal("1.00") * Decimal(hedged_qty)) - h_cost
+
+            # Orphan liquidation loss
+            fill_px = orphan_res.fill_price or Decimal("0.50")
             exit_px = recovery_result.fill_price or (fill_px - self.settings.MAX_ORPHAN_EXIT_LOSS)
-            unwind_loss = fill_px - exit_px
-            realized_pnl = -unwind_loss - filled_res.fee_paid - recovery_result.fee_paid
+            unwind_loss = (fill_px - exit_px) * Decimal(orphan_qty)
+            yes_fee = result_yes.fee_paid if result_yes.fill_quantity > 0 else Decimal("0.00")
+            no_fee = result_no.fee_paid if result_no.fill_quantity > 0 else Decimal("0.00")
+            recovery_fee = recovery_result.fee_paid if recovery_result else Decimal("0.00")
+            total_fees = yes_fee + no_fee + recovery_fee
+            realized_pnl = hedged_pnl - unwind_loss - total_fees
+
             logger.warning(
-                "EMERGENCY UNWIND COMPLETE for %s: UnwindLoss=-$%.4f, Net P&L=-$%.4f",
-                trade_id, unwind_loss, realized_pnl
+                "TARGETED UNWIND COMPLETE for %s: OrphanQty=%d, UnwindLoss=-$%.4f, Net P&L=-$%.4f",
+                trade_id, orphan_qty, unwind_loss, realized_pnl
             )
 
         total_cost = (
-            (result_yes.fill_price or Decimal("0.00")) + (result_no.fill_price or Decimal("0.00"))
+            (result_yes.fill_price or Decimal("0.00")) * Decimal(result_yes.fill_quantity)
+            + (result_no.fill_price or Decimal("0.00")) * Decimal(result_no.fill_quantity)
         )
-        total_fees = result_yes.fee_paid + result_no.fee_paid
+        yes_fee = result_yes.fee_paid if result_yes.fill_quantity > 0 else Decimal("0.00")
+        no_fee = result_no.fee_paid if result_no.fill_quantity > 0 else Decimal("0.00")
+        recovery_fee = recovery_result.fee_paid if recovery_result else Decimal("0.00")
+        total_fees = yes_fee + no_fee + recovery_fee
 
         record = ArbitrageTradeRecord(
             trade_id=trade_id,
@@ -306,7 +358,7 @@ class ExecutionEngine:
             recovery_action=recovery_action,
             recovery_result=recovery_result,
             total_cost=total_cost,
-            payout_expected=Decimal("1.00") if is_hedged else Decimal("0.00"),
+            payout_expected=(Decimal("1.00") * Decimal(hedged_qty)) if is_hedged else Decimal("0.00"),
             fees_paid=total_fees,
             realized_pnl=realized_pnl,
             latencies_ns={
@@ -323,15 +375,18 @@ class ExecutionEngine:
         self,
         filled_res: OrderExecutionResult,
         filled_req: OrderRequest,
+        unwind_quantity: int,
         mode: str,
         opp: ArbitrageOpportunity,
     ) -> OrderExecutionResult:
-        """Immediately exit the unhedged leg within MAX_ORPHAN_EXIT_LOSS."""
+        """Immediately exit the unhedged leg of exactly unwind_quantity within MAX_ORPHAN_EXIT_LOSS."""
         now_ns = time.perf_counter_ns()
+        qty_to_unwind = unwind_quantity if unwind_quantity > 0 else filled_res.fill_quantity
+        fill_px = filled_res.fill_price or Decimal("0.50")
+        exit_px = max(Decimal("0.01"), fill_px - self.settings.MAX_ORPHAN_EXIT_LOSS)
+
         if mode == "PAPER":
             # Simulate unwind exit at 1-2 cents below purchase price
-            fill_px = filled_res.fill_price or Decimal("0.50")
-            exit_px = max(Decimal("0.01"), fill_px - self.settings.MAX_ORPHAN_EXIT_LOSS)
             return OrderExecutionResult(
                 venue=filled_res.venue,
                 order_id=f"unwind-{uuid.uuid4().hex[:8]}",
@@ -340,8 +395,8 @@ class ExecutionEngine:
                 status=ExecutionStatus.FILLED,
                 price=exit_px,
                 fill_price=exit_px,
-                quantity=filled_res.fill_quantity,
-                fill_quantity=filled_res.fill_quantity,
+                quantity=qty_to_unwind,
+                fill_quantity=qty_to_unwind,
                 fee_paid=Decimal("0.01"),
                 submitted_at_ns=now_ns,
                 ack_at_ns=now_ns,
@@ -351,26 +406,54 @@ class ExecutionEngine:
         # LIVE MODE EMERGENCY CLOSE
         try:
             if filled_res.venue == Venue.POLYMARKET_US:
-                logger.info("Calling Polymarket US native close_position for '%s'", filled_req.market_id)
-                close_resp = await self.poly_client.close_position(filled_req.market_id)
-                return OrderExecutionResult(
-                    venue=Venue.POLYMARKET_US,
-                    order_id=str(close_resp.get("orderId", "")),
+                logger.info(
+                    "Executing targeted Polymarket US IOC sell unwind for %d contracts on '%s'",
+                    qty_to_unwind, filled_req.market_id
+                )
+                sell_req = OrderRequest(
                     client_order_id=f"unwind-{uuid.uuid4().hex[:8]}",
                     opportunity_id=opp.opportunity_id,
-                    status=ExecutionStatus.FILLED,
-                    price=Decimal("0.00"),
-                    fill_price=Decimal(str(close_resp.get("fillPrice", filled_res.fill_price or Decimal("0.50")))),
-                    quantity=filled_res.fill_quantity,
-                    fill_quantity=filled_res.fill_quantity,
-                    fee_paid=Decimal("0.01"),
-                    submitted_at_ns=now_ns,
-                    ack_at_ns=time.perf_counter_ns(),
-                    filled_at_ns=time.perf_counter_ns(),
-                    raw_response=close_resp,
+                    venue=Venue.POLYMARKET_US,
+                    market_id=filled_req.market_id,
+                    ticker=filled_req.ticker,
+                    side=OrderSide.SELL,
+                    outcome=filled_req.outcome,
+                    price=exit_px,
+                    quantity=qty_to_unwind,
+                    order_type=OrderType.LIMIT,
+                    time_in_force=TimeInForce.IOC,
                 )
+                try:
+                    res = await self.poly_client.create_order(sell_req)
+                    if res.status == ExecutionStatus.FILLED and res.fill_quantity > 0:
+                        return res
+                except Exception as poly_err:
+                    logger.warning("Targeted Polymarket IOC SELL failed (%s), attempting native close_position fallback", poly_err)
+
+                # Fallback to native close_position if entire position was unhedged
+                if qty_to_unwind == filled_res.fill_quantity:
+                    logger.info("Calling Polymarket US native close_position for '%s'", filled_req.market_id)
+                    close_resp = await self.poly_client.close_position(filled_req.market_id)
+                    return OrderExecutionResult(
+                        venue=Venue.POLYMARKET_US,
+                        order_id=str(close_resp.get("orderId", "")),
+                        client_order_id=f"unwind-{uuid.uuid4().hex[:8]}",
+                        opportunity_id=opp.opportunity_id,
+                        status=ExecutionStatus.FILLED,
+                        price=Decimal("0.00"),
+                        fill_price=Decimal(str(close_resp.get("fillPrice", fill_px))),
+                        quantity=qty_to_unwind,
+                        fill_quantity=qty_to_unwind,
+                        fee_paid=Decimal("0.01"),
+                        submitted_at_ns=now_ns,
+                        ack_at_ns=time.perf_counter_ns(),
+                        filled_at_ns=time.perf_counter_ns(),
+                        raw_response=close_resp,
+                    )
+                raise RuntimeError(f"Polymarket US IOC unwind failed for {qty_to_unwind} contracts")
             else:
-                # Kalshi unwind: sell opposite side
+                # Kalshi unwind: targeted IOC SELL order
+                logger.info("Executing Kalshi targeted IOC sell unwind for %d contracts on '%s'", qty_to_unwind, filled_req.ticker)
                 sell_req = OrderRequest(
                     client_order_id=f"unwind-{uuid.uuid4().hex[:8]}",
                     opportunity_id=opp.opportunity_id,
@@ -379,8 +462,8 @@ class ExecutionEngine:
                     ticker=filled_req.ticker,
                     side=OrderSide.SELL,
                     outcome=filled_req.outcome,
-                    price=max(Decimal("0.01"), (filled_res.fill_price or Decimal("0.50")) - self.settings.MAX_ORPHAN_EXIT_LOSS),
-                    quantity=filled_res.fill_quantity,
+                    price=exit_px,
+                    quantity=qty_to_unwind,
                     order_type=OrderType.LIMIT,
                     time_in_force=TimeInForce.IOC,
                 )

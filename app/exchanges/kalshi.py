@@ -202,8 +202,9 @@ class KalshiClient:
             "action": "buy" if order.side.value == "BUY" else "sell",
             "side": "yes" if order.outcome.value == "YES" else "no",
             "type": "limit",
+            "time_in_force": "ioc",
             "count": order.quantity,
-            "expiration_ts": int(time.time()) + 5,
+            "expiration_ts": int(time.time()) + 10,
         }
 
         if order.outcome.value == "YES":
@@ -219,19 +220,52 @@ class KalshiClient:
 
                 if resp.status in (200, 201):
                     order_info = data.get("order", data)
-                    order_id = order_info.get("order_id") or order_info.get("id")
-                    status_raw = order_info.get("status", "executed")
-                    is_filled = status_raw in ("executed", "filled")
-                    status = ExecutionStatus.FILLED if is_filled else ExecutionStatus.ACKNOWLEDGED
+                    order_id = str(order_info.get("order_id") or order_info.get("id") or "")
+                    status_raw = str(order_info.get("status", "")).lower()
 
+                    # Accurate fill count extraction
+                    fill_count = 0
+                    for count_key in ("taker_fill_count", "fill_count", "executed_count", "filled_count"):
+                        val = order_info.get(count_key)
+                        if val is not None:
+                            try:
+                                fill_count = int(val)
+                                break
+                            except Exception:
+                                pass
+
+                    if fill_count == 0 and status_raw in ("executed", "filled"):
+                        fill_count = order.quantity
+
+                    if status_raw in ("executed", "filled") or fill_count >= order.quantity:
+                        status = ExecutionStatus.FILLED
+                        fill_qty = order.quantity
+                    elif fill_count > 0:
+                        status = ExecutionStatus.PARTIALLY_FILLED
+                        fill_qty = fill_count
+                    elif status_raw in ("canceled", "cancelled", "expired", "rejected"):
+                        status = ExecutionStatus.REJECTED
+                        fill_qty = 0
+                    else:
+                        status = ExecutionStatus.ACKNOWLEDGED
+                        fill_qty = 0
+
+                    # Fill price extraction
                     fill_price = order.price
-                    if "yes_price" in order_info and order.outcome.value == "YES":
+                    if "taker_fill_cost" in order_info and fill_qty > 0:
+                        fill_price = (Decimal(str(order_info["taker_fill_cost"])) / Decimal(fill_qty)) / Decimal("100")
+                    elif "yes_price" in order_info and order.outcome.value == "YES":
                         fill_price = Decimal(str(order_info["yes_price"])) / Decimal("100")
                     elif "no_price" in order_info and order.outcome.value == "NO":
                         fill_price = Decimal(str(order_info["no_price"])) / Decimal("100")
 
+                    # Fee extraction
                     fee_paid = Decimal("0.00")
-                    if "fee" in order_info:
+                    if "taker_fees_dollars" in order_info:
+                        fee_paid = Decimal(str(order_info["taker_fees_dollars"]))
+                    elif "taker_fees" in order_info:
+                        fee_paid = Decimal(str(order_info["taker_fees"])) / Decimal("100")
+                    elif "fee" in order_info:
                         fee_paid = Decimal(str(order_info["fee"])) / Decimal("100")
 
                     return OrderExecutionResult(
@@ -243,11 +277,11 @@ class KalshiClient:
                         price=order.price,
                         fill_price=fill_price,
                         quantity=order.quantity,
-                        fill_quantity=order.quantity if is_filled else 0,
+                        fill_quantity=fill_qty,
                         fee_paid=fee_paid,
                         submitted_at_ns=submit_ns,
                         ack_at_ns=ack_ns,
-                        filled_at_ns=ack_ns if is_filled else 0,
+                        filled_at_ns=ack_ns if fill_qty > 0 else 0,
                         raw_response=data,
                     )
                 else:

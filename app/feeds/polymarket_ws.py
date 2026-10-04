@@ -111,6 +111,7 @@ class PolymarketFeed:
                 break
             except Exception as e:
                 self._connected = False
+                self.order_book = None
                 logger.warning("Polymarket WS disconnected (%s), reconnecting in %.1fs...", e, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(5.0, backoff * 1.5)
@@ -172,11 +173,14 @@ class PolymarketFeed:
 
         best_bid_val = md.get("bestBid", {}).get("value")
         best_ask_val = md.get("bestAsk", {}).get("value")
-        ask_depth = md.get("askDepth", 1)
-        bid_depth = md.get("bidDepth", 1)
+        ask_depth = md.get("askDepth")
+        bid_depth = md.get("bidDepth")
 
-        best_bid = Decimal(str(best_bid_val)) if best_bid_val else None
-        best_ask = Decimal(str(best_ask_val)) if best_ask_val else None
+        best_bid = Decimal(str(best_bid_val)) if best_bid_val is not None else None
+        best_ask = Decimal(str(best_ask_val)) if best_ask_val is not None else None
+
+        ask_qty = Decimal(str(ask_depth)) if ask_depth is not None else (Decimal("0") if best_ask else None)
+        bid_qty = Decimal(str(bid_depth)) if bid_depth is not None else (Decimal("0") if best_bid else None)
 
         best_no_bid = (Decimal("1.00") - best_ask) if best_ask else None
         best_no_ask = (Decimal("1.00") - best_bid) if best_bid else None
@@ -186,19 +190,19 @@ class PolymarketFeed:
             market_id=market_slug,
             ticker=market_slug,
             timestamp_ns=recv_ns,
-            yes_bids=[OrderBookLevel(price=best_bid, quantity=Decimal(str(bid_depth)))] if best_bid else [],
-            yes_asks=[OrderBookLevel(price=best_ask, quantity=Decimal(str(ask_depth)))] if best_ask else [],
+            yes_bids=[OrderBookLevel(price=best_bid, quantity=bid_qty)] if (best_bid and bid_qty and bid_qty > 0) else [],
+            yes_asks=[OrderBookLevel(price=best_ask, quantity=ask_qty)] if (best_ask and ask_qty and ask_qty > 0) else [],
             best_yes_bid=best_bid,
             best_yes_ask=best_ask,
             best_no_bid=best_no_bid,
             best_no_ask=best_no_ask,
-            best_yes_ask_size=Decimal(str(ask_depth)),
-            best_no_ask_size=Decimal(str(bid_depth)),
+            best_yes_ask_size=ask_qty,
+            best_no_ask_size=bid_qty,
             updated_at=datetime.now(timezone.utc),
         )
 
     async def _poll_bbo_loop(self) -> None:
-        """High-frequency REST BBO polling loop for unauthenticated / data mode."""
+        """High-frequency REST BBO polling loop with WS collision prevention."""
         self._connected = True
         while self._running:
             try:
@@ -207,11 +211,19 @@ class PolymarketFeed:
                     continue
 
                 recv_ns = time.perf_counter_ns()
+
+                # WS collision check: if WS is active and received data in the last 500ms, don't overwrite
+                if self._ws_task and not self._ws_task.done() and (recv_ns - self.last_update_ns) < 500_000_000:
+                    await asyncio.sleep(0.25)
+                    continue
+
                 bbo_resp = await self.client.get_bbo(self.current_market_slug)
-                book = self._parse_bbo_to_orderbook(self.current_market_slug, bbo_resp, recv_ns)
-                self.order_book = book
-                self.last_update_ns = recv_ns
-                self._notify(book)
+                now_ns = time.perf_counter_ns()
+                if now_ns > self.last_update_ns:
+                    book = self._parse_bbo_to_orderbook(self.current_market_slug, bbo_resp, now_ns)
+                    self.order_book = book
+                    self.last_update_ns = now_ns
+                    self._notify(book)
 
                 # Poll every 250ms
                 await asyncio.sleep(0.25)

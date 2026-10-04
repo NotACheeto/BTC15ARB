@@ -31,6 +31,7 @@ class RiskManager:
         self.active_arbitrages: dict[str, ArbitrageOpportunity] = {}
         self.active_market_windows: set[str] = set()
         self.current_unhedged_contracts: int = 0
+        self.cumulative_unhedged_contracts: int = 0
 
         # Balances
         self.polymarket_balance: Decimal = Decimal("0.00")
@@ -154,8 +155,15 @@ class RiskManager:
         self.active_arbitrages[opp.opportunity_id] = opp
         self.active_market_windows.add(opp.market_window)
 
-    def record_arbitrage_finished(self, opp_id: str, market_window: str, unhedged: int = 0) -> None:
-        """Release concurrency locks."""
+    def record_arbitrage_finished(
+        self,
+        opp_id: str,
+        market_window: str,
+        unhedged: int = 0,
+        orphan_encountered: int = 0,
+    ) -> None:
+        """Release concurrency locks and record unhedged and cumulative orphan contracts."""
         self.active_arbitrages.pop(opp_id, None)
         self.active_market_windows.discard(market_window)
-        self.current_unhedged_contracts = max(0, unhedged)
+        self.current_unhedged_contracts += max(0, unhedged)
+        self.cumulative_unhedged_contracts += max(0, orphan_encountered)
